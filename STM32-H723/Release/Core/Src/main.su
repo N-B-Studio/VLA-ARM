@@ -1,0 +1,11 @@
+../Core/Src/main.c:82:13:log_uart1	8	static
+../Core/Src/main.c:87:13:logf_uart1	16	static
+../Core/Src/main.c:274:13:fatal	8	static,ignoring_inline_asm
+../Core/Src/main.c:160:12:jc_set_torque_nm.constprop	16	static
+../Core/Src/main.c:150:12:jc_set_abs_pos_deg.constprop.isra	16	static
+../Core/Src/main.c:196:12:jc_read_mode.constprop.isra	16	static
+../Core/Src/main.c:202:12:jc_idle.constprop.isra	16	static
+../Core/Src/main.c:582:6:SystemClock_Config	128	static
+../Core/Src/main.c:289:5:main	136	static
+../Core/Src/main.c:637:6:HAL_TIM_PeriodElapsedCallback	0	static
+../Core/Src/main.c:651:6:Error_Handler	0	static
