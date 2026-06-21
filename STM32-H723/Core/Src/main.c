@@ -21,7 +21,6 @@
 /* USER CODE BEGIN PD */
 #include "ws2812.h"
 #include "bsp_fdcan.h"
-#include "BMI088Middleware.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdarg.h>
@@ -32,35 +31,40 @@
 /* USER CODE BEGIN PM */
 typedef struct {
     uint8_t node_id;
-    float   cmd_deg;
-} MotorAxis;
+    float pos_deg;
+    float vel_rpm;
+    float torque_fb_nm;
+    uint32_t rx_count;
+    uint32_t last_rx_ms;
+} JC_MotorState;
 
-MotorAxis motor_left_wheel   = {1, 0};
-MotorAxis motor_right_wheel  = {2, 0};
-MotorAxis motor_neck         = {3, 0};  // IMU\u6302\u5728\u8116\u5b50\u4e0a
+// If your two gripper motors are actually ID 2/3, keep this.
+// If you changed them to ID 1/2, change these two only.
+#define NODE_LEADER    1
+#define NODE_FOLLOWER  2
 
-
-
+static JC_MotorState leader   = {NODE_LEADER,   0};
+static JC_MotorState follower = {NODE_FOLLOWER, 0};
 /* USER CODE END PM */
 
 /* Private variables ---------------------------------------------------------*/
 
 /* USER CODE BEGIN PV */
-// 1kHz flag
+// 1kHz control flag from TIM2
 volatile uint8_t loop_1khz_flag = 0;
 
-// attitude
-static float pitch_deg = 0.0f;  // \u55ac\u4eea\u89d2-\u7528\u4e8e\u5e73\u8861\u63a7\u5236
+// timing/debug
+static uint32_t loop_count = 0;
+static uint32_t can_tx_drop = 0;
+static uint32_t can_rx_other = 0;
 
-// target command (deg) - \u53ea\u63a7\u5236pitch\u7528\u4e8eLR\u8f6e\u5e73\u8861
-static float cmd_pitch_deg = 0.0f;
+// virtual coupling gains
+static float K_COUPLE = 0.040f;     // Nm/rad
+static float D_COUPLE = 0.0015f;    // Nm/(rad/s)
+static float TAU_MAX  = 0.080f;     // Nm, start small
 
-// gains
-static float K_pitch = 1.0f;  // \u5e73\u8861\u53cd\u9988\u589e\u76ca
-
-// dt
-static const float dt = 0.001f;
-static const float RAD2DEG = 57.2957795f;
+static const float DEG2RAD = 0.01745329252f;
+static const float RPM2RAD = 0.10471975512f;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -70,14 +74,13 @@ void SystemClock_Config(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
-
 // ===== WS2812 LED status helpers =====
 static inline void led_yellow(void){ WS2812_Ctrl(60, 60, 0); }
 static inline void led_red(void)   { WS2812_Ctrl(80, 0, 0);  }
 static inline void led_green(void) { WS2812_Ctrl(0, 80, 0);  }
 
 // ===== UART1 logging =====
-static char logbuf[160];
+static char logbuf[192];
 
 static void log_uart1(const char *s)
 {
@@ -88,198 +91,127 @@ static void logf_uart1(const char *fmt, ...)
 {
     va_list ap;
     va_start(ap, fmt);
-
-    // 注意：vsnprintf 返回“本应写入的长度”，可能 >= sizeof(logbuf)
     int n = vsnprintf(logbuf, sizeof(logbuf), fmt, ap);
-
     va_end(ap);
-
     if (n < 0) return;
-
-    // 实际可发送长度 = buffer 内真实字符串长度（避免发到旧内容）
     size_t len = strnlen(logbuf, sizeof(logbuf));
-
     HAL_UART_Transmit(&huart1, (uint8_t*)logbuf, (uint16_t)len, 100);
 }
 
+// ===== Power 1 enable: PC14 =====
+#define MOTOR_EN_PORT GPIOC
+#define MOTOR_EN_PIN_1  GPIO_PIN_14
+#define MOTOR_EN_PIN_2  GPIO_PIN_13
 
-// ===== Gimbal enable: PC14 =====
-#define GIMBAL_EN_PORT GPIOC
-#define GIMBAL_EN_PIN  GPIO_PIN_14
-
-static inline void gimbal_enable(uint8_t en)
+static inline void arm_enable(uint8_t en)
 {
-    HAL_GPIO_WritePin(GIMBAL_EN_PORT, GIMBAL_EN_PIN, en ? GPIO_PIN_SET : GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(MOTOR_EN_PORT, MOTOR_EN_PIN_1, en ? GPIO_PIN_SET : GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(MOTOR_EN_PORT, MOTOR_EN_PIN_2, en ? GPIO_PIN_SET : GPIO_PIN_RESET);
 }
 
-// ===== Nodes =====
-#define NODE_LEFT_WHEEL  1  // 左轮 - 平衡控制
-#define NODE_RIGHT_WHEEL 2  // 右轮 - 平衡控制
-#define NODE_NECK        3  // 脖子 - 固定零位（IMU挂在脖子上）
-
-// ===== JC SDO write helpers =====
+// ===== JC protocol helpers =====
 static inline uint16_t jc_tx_id(uint8_t node_id){ return (uint16_t)(0x600 + node_id); }
 
-static inline void be_u16(uint8_t *p, uint16_t v){
-    p[0] = (uint8_t)(v >> 8);
-    p[1] = (uint8_t)(v & 0xFF);
+static inline float clampf(float x, float lo, float hi)
+{
+    if (x > hi) return hi;
+    if (x < lo) return lo;
+    return x;
 }
-static inline void be_i32(uint8_t *p, int32_t v){
-    p[0] = (uint8_t)(v >> 24);
-    p[1] = (uint8_t)(v >> 16);
-    p[2] = (uint8_t)(v >> 8);
-    p[3] = (uint8_t)(v & 0xFF);
+
+static inline int16_t be_s16(const uint8_t *p)
+{
+    return (int16_t)((uint16_t)p[0] << 8 | p[1]);
+}
+
+static inline int32_t be_s24(const uint8_t *p)
+{
+    int32_t v = ((int32_t)p[0] << 16) | ((int32_t)p[1] << 8) | p[2];
+    if (v & 0x00800000) v |= 0xFF000000;
+    return v;
+}
+
+static int jc_send8(FDCAN_HandleTypeDef *hcan, uint16_t std_id, const uint8_t d[8])
+{
+    int r = fdcanx_send_data(hcan, std_id, (uint8_t*)d, 8);
+    if (r != 0) can_tx_drop++;
+    return r;
+}
+
+static int jc_set_mode(FDCAN_HandleTypeDef *hcan, uint8_t node_id, uint16_t mode)
+{
+    uint8_t d[8] = {0x2B, 0x00, 0x60, 0x00, 0, 0, 0, 0};
+    d[4] = (uint8_t)(mode >> 8);
+    d[5] = (uint8_t)(mode & 0xFF);
+    return jc_send8(hcan, jc_tx_id(node_id), d);
 }
 
 static int jc_enter_closed_loop(FDCAN_HandleTypeDef *hcan, uint8_t node_id)
 {
-    // 2B 00 A2 00 00 01 00 00
     uint8_t d[8] = {0x2B, 0x00, 0xA2, 0x00, 0x00, 0x01, 0x00, 0x00};
-    return fdcanx_send_data(hcan, jc_tx_id(node_id), d, 8);
+    return jc_send8(hcan, jc_tx_id(node_id), d);
 }
 
-// mode: 4 = 位置直通 
-static int jc_set_mode(FDCAN_HandleTypeDef *hcan, uint8_t node_id, uint16_t mode)
-{
-    // 2B 00 60 00 00 mm 00 00
-    uint8_t d[8] = {0x2B, 0x00, 0x60, 0x00, 0, 0, 0, 0};
-    be_u16(&d[4], mode);
-    return fdcanx_send_data(hcan, jc_tx_id(node_id), d, 8);
-}
-
-static int jc_set_abs_pos_deg(FDCAN_HandleTypeDef *hcan, uint8_t node_id, float deg)
-{
-    // 23 00 23 00 [int32_be] , deg*100
-    int32_t v = (int32_t)(deg * 100.0f);
-    uint8_t d[8] = {0x23, 0x00, 0x23, 0x00, 0, 0, 0, 0};
-    be_i32(&d[4], v);
-    return fdcanx_send_data(hcan, jc_tx_id(node_id), d, 8);
-}
-
-// 0=力矩模式，4=位置直通模式
-static int jc_set_torque_nm(FDCAN_HandleTypeDef *hcan, uint8_t node_id, float torque_nm)
-{
-    // 文档：扭矩寄存器 0x0020，放大 100 倍
-    int16_t v = (int16_t)(torque_nm * 100.0f);
-
-    uint8_t d[8] = {0x2B, 0x00, 0x20, 0x00, 0, 0, 0, 0};
-
-    d[4] = (uint8_t)((v >> 8) & 0xFF);
-    d[5] = (uint8_t)(v & 0xFF);
-
-    return fdcanx_send_data(hcan, jc_tx_id(node_id), d, 8);
-}
-static int jc_set_speed_rpm(FDCAN_HandleTypeDef *hcan, uint8_t node_id, float rpm)
-{
-    // 文档：速度寄存器 0x0021，rpm * 100
-    int32_t v = (int32_t)(rpm * 100.0f);
-
-    uint8_t d[8] = {0x23, 0x00, 0x21, 0x00, 0, 0, 0, 0};
-    be_i32(&d[4], v);
-
-    return fdcanx_send_data(hcan, jc_tx_id(node_id), d, 8);
-}
-
-static int jc_set_low_speed_rpm(FDCAN_HandleTypeDef *hcan, uint8_t node_id, float rpm)
-{
-    // 文档：低速寄存器 0x0027，rpm * 100，2字节
-    int16_t v = (int16_t)(rpm * 100.0f);
-
-    uint8_t d[8] = {0x2B, 0x00, 0x27, 0x00, 0, 0, 0, 0};
-
-    d[4] = (uint8_t)((v >> 8) & 0xFF);
-    d[5] = (uint8_t)(v & 0xFF);
-
-    return fdcanx_send_data(hcan, jc_tx_id(node_id), d, 8);
-}
-// 读模式寄存器，测试用
-static int jc_read_mode(FDCAN_HandleTypeDef *hcan, uint8_t node_id)
-{
-    // 读控制模式寄存器 0x0060
-    uint8_t d[8] = {0x4B, 0x00, 0x60, 0x00, 0, 0, 0, 0};
-    return fdcanx_send_data(hcan, jc_tx_id(node_id), d, 8);
-}
 static int jc_idle(FDCAN_HandleTypeDef *hcan, uint8_t node_id)
 {
-    // 2B 00 A0 00 00 01 00 00
     uint8_t d[8] = {0x2B, 0x00, 0xA0, 0x00, 0x00, 0x01, 0x00, 0x00};
-    return fdcanx_send_data(hcan, jc_tx_id(node_id), d, 8);
+    return jc_send8(hcan, jc_tx_id(node_id), d);
 }
 
-static int jc_read_speed(FDCAN_HandleTypeDef *hcan, uint8_t node_id)
+static int jc_set_torque_nm(FDCAN_HandleTypeDef *hcan, uint8_t node_id, float torque_nm)
 {
-    // 读实时速度 0x0006
-    uint8_t d[8] = {0x43, 0x00, 0x06, 0x00, 0, 0, 0, 0};
-    return fdcanx_send_data(hcan, jc_tx_id(node_id), d, 8);
+    torque_nm = clampf(torque_nm, -TAU_MAX, TAU_MAX);
+    int16_t v = (int16_t)(torque_nm * 100.0f); // JC: Nm * 100
+
+    uint8_t d[8] = {0x2B, 0x00, 0x20, 0x00, 0, 0, 0, 0};
+    d[4] = (uint8_t)((v >> 8) & 0xFF);
+    d[5] = (uint8_t)(v & 0xFF);
+    return jc_send8(hcan, jc_tx_id(node_id), d);
 }
 
-static int jc_read_position(FDCAN_HandleTypeDef *hcan, uint8_t node_id)
+void jc_parse_feedback(uint16_t rx_id, uint8_t *d, uint8_t len)
 {
-    // 读实时位置 0x0008
-    uint8_t d[8] = {0x43, 0x00, 0x08, 0x00, 0, 0, 0, 0};
-    return fdcanx_send_data(hcan, jc_tx_id(node_id), d, 8);
-}
+    if (len != 8) return;
 
-static int jc_read_current(FDCAN_HandleTypeDef *hcan, uint8_t node_id)
-{
-    // 读母线电流 0x0005
-    uint8_t d[8] = {0x4B, 0x00, 0x05, 0x00, 0, 0, 0, 0};
-    return fdcanx_send_data(hcan, jc_tx_id(node_id), d, 8);
-}
+    uint8_t node = 0;
+    JC_MotorState *m = NULL;
 
-static int jc_read_error(FDCAN_HandleTypeDef *hcan, uint8_t node_id)
-{
-    // 读错误码 0x000C
-    uint8_t d[8] = {0x43, 0x00, 0x0C, 0x00, 0, 0, 0, 0};
-    return fdcanx_send_data(hcan, jc_tx_id(node_id), d, 8);
-}
-
-static void torque_step_test(uint8_t node_id, float tq, uint32_t hold_ms)
-{
-    logf_uart1("[TQ] node=%d tq=%.2fNm hold=%lums\r\n", node_id, tq, hold_ms);
-
-    jc_set_torque_nm(&hfdcan1, node_id, tq);
-
-    uint32_t t0 = HAL_GetTick();
-    uint32_t last_read = 0;
-
-    while ((HAL_GetTick() - t0) < hold_ms)
-    {
-        uint32_t now = HAL_GetTick();
-
-        // 每100ms请求一次状态。需要你用Canable/candump看0x581回复
-        if ((now - last_read) >= 100)
-        {
-            last_read = now;
-
-            jc_read_speed(&hfdcan1, node_id);
-            HAL_Delay(2);
-
-            jc_read_position(&hfdcan1, node_id);
-            HAL_Delay(2);
-
-            jc_read_current(&hfdcan1, node_id);
-            HAL_Delay(2);
-
-            jc_read_error(&hfdcan1, node_id);
-            HAL_Delay(2);
-        }
-
-        HAL_Delay(1);
+    if (rx_id == (0x580 + NODE_LEADER)) {
+        node = NODE_LEADER;
+        m = &leader;
+    } else if (rx_id == (0x580 + NODE_FOLLOWER)) {
+        node = NODE_FOLLOWER;
+        m = &follower;
+    } else {
+        can_rx_other++;
+        return;
     }
 
-    jc_set_torque_nm(&hfdcan1, node_id, 0.0f);
-    HAL_Delay(500);
+    (void)node;
+
+    // Torque/position/speed command reply:
+    // 2A [pos 24-bit, deg*100] [speed 16-bit, rpm*100] [current/torque 16-bit, *100]
+    if (d[0] == 0x2A) {
+        int32_t pos_raw = be_s24(&d[1]);
+        int16_t vel_raw = be_s16(&d[4]);
+        int16_t tq_raw  = be_s16(&d[6]);
+
+        m->pos_deg = (float)pos_raw / 100.0f;
+        m->vel_rpm = (float)vel_raw / 100.0f;
+        m->torque_fb_nm = (float)tq_raw / 100.0f;
+        m->rx_count++;
+        m->last_rx_ms = HAL_GetTick();
+    }
 }
+
 static void fatal(const char *msg)
 {
     led_red();
     logf_uart1("[FATAL] %s\r\n", msg);
-    gimbal_enable(0);
+    arm_enable(0);
     __disable_irq();
     while (1) { HAL_Delay(1000); }
 }
-
 /* USER CODE END 0 */
 
 /**
@@ -318,256 +250,103 @@ int main(void)
   MX_SPI6_Init();
   /* USER CODE BEGIN 2 */
   led_yellow();
-  log_uart1("\r\n[BOOT] H725 gimbal IMU sync control\r\n");
+  log_uart1("\r\n[BOOT] H725/H723 JC gripper 1kHz force-feedback demo\r\n");
 
-  // power off first
-  gimbal_enable(0);
+  arm_enable(0);
   HAL_Delay(50);
 
-  // CAN
   log_uart1("[INIT] CAN...\r\n");
   bsp_can_init();
   HAL_Delay(50);
 
-  // IMU
-  log_uart1("[INIT] IMU...\r\n");
-  uint8_t imu_err = BMI088_init();
-  if (imu_err) fatal("BMI088_init failed");
+  // If bsp_can_init() does not already enable RX interrupt, this makes it explicit.
+  HAL_FDCAN_ActivateNotification(&hfdcan1, FDCAN_IT_RX_FIFO0_NEW_MESSAGE, 0);
 
-  // 1kHz timer
   HAL_TIM_Base_Start_IT(&htim2);
 
-  // enable gimbal power
-  log_uart1("[INIT] GIMBAL EN=1\r\n");
-  gimbal_enable(1);
+  log_uart1("[INIT] motor power enable\r\n");
+  arm_enable(1);
   HAL_Delay(500);
 
+  log_uart1("[INIT] idle motors\r\n");
+  jc_idle(&hfdcan1, NODE_LEADER);
+  HAL_Delay(100);
+  jc_idle(&hfdcan1, NODE_FOLLOWER);
+  HAL_Delay(100);
 
+  log_uart1("[INIT] torque mode\r\n");
+  if (jc_set_mode(&hfdcan1, NODE_LEADER, 0) != 0) fatal("mode0 leader");
+  HAL_Delay(100);
+  if (jc_set_mode(&hfdcan1, NODE_FOLLOWER, 0) != 0) fatal("mode0 follower");
+  HAL_Delay(100);
 
-  // node1/2: torque mode for balance wheels
-  // node3: position passthrough for head
-  log_uart1("[INIT] idle all motors\r\n");
+  log_uart1("[INIT] closed loop\r\n");
+  if (jc_enter_closed_loop(&hfdcan1, NODE_LEADER) != 0) fatal("closed leader");
+  HAL_Delay(100);
+  if (jc_enter_closed_loop(&hfdcan1, NODE_FOLLOWER) != 0) fatal("closed follower");
+  HAL_Delay(100);
 
-jc_idle(&hfdcan1, NODE_LEFT_WHEEL);
-HAL_Delay(100);
-
-jc_idle(&hfdcan1, NODE_RIGHT_WHEEL);
-HAL_Delay(100);
-
-jc_idle(&hfdcan1, NODE_NECK);
-HAL_Delay(100);
-
-
-log_uart1("[INIT] set modes\r\n");
-
-if (jc_set_mode(&hfdcan1, NODE_LEFT_WHEEL, 0) != 0) fatal("mode0 node1");
-HAL_Delay(100);
-
-if (jc_set_mode(&hfdcan1, NODE_RIGHT_WHEEL, 0) != 0) fatal("mode0 node2");
-HAL_Delay(100);
-
-if (jc_set_mode(&hfdcan1, NODE_NECK, 4) != 0) fatal("mode4 node3");
-HAL_Delay(100);
-
-
-log_uart1("[INIT] enter closed loop\r\n");
-
-if (jc_enter_closed_loop(&hfdcan1, NODE_LEFT_WHEEL) != 0) fatal("closed_loop node1");
-HAL_Delay(100);
-
-if (jc_enter_closed_loop(&hfdcan1, NODE_RIGHT_WHEEL) != 0) fatal("closed_loop node2");
-HAL_Delay(100);
-
-if (jc_enter_closed_loop(&hfdcan1, NODE_NECK) != 0) fatal("closed_loop node3");
-HAL_Delay(100);
-
-
-// 初始输出全部清零
-jc_set_torque_nm(&hfdcan1, NODE_LEFT_WHEEL, 0.0f);
-HAL_Delay(20);
-
-jc_set_torque_nm(&hfdcan1, NODE_RIGHT_WHEEL, 0.0f);
-HAL_Delay(20);
-
-jc_set_abs_pos_deg(&hfdcan1, NODE_NECK, 0.0f);
-HAL_Delay(20);
-
-log_uart1("[INIT] motors ready\r\n");
+  jc_set_torque_nm(&hfdcan1, NODE_LEADER, 0.0f);
   HAL_Delay(20);
-  // start at 0 deg - 脖子固定在零位
-  //jc_set_abs_pos_deg(&hfdcan1, NODE_NECK, 0.0f);
+  jc_set_torque_nm(&hfdcan1, NODE_FOLLOWER, 0.0f);
   HAL_Delay(20);
-  log_uart1("[INIT] neck initialized to 0deg\r\n");
 
   led_green();
-  log_uart1("[OK] running 1kHz IMU->CAN\r\n");
-  
-  jc_read_mode(&hfdcan1, NODE_LEFT_WHEEL);
-  HAL_Delay(50);
-
-  jc_read_mode(&hfdcan1, NODE_RIGHT_WHEEL);
-  HAL_Delay(50);
-
-  jc_read_mode(&hfdcan1, NODE_NECK);
-  HAL_Delay(50);
-
-  /* USER CODE END 2 */
+  logf_uart1("[OK] 1kHz demo running. leader=%d follower=%d\r\n", NODE_LEADER, NODE_FOLLOWER);
+/* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
-  uint32_t last_50ms_log_ms = HAL_GetTick();
-  uint8_t neck_div = 0;
+  uint32_t last_log_ms = HAL_GetTick();
+  uint32_t last_rx2 = 0, last_rx3 = 0;
 
-  float gyro[3], accel[3], temp = 0.0f;
-  const float alpha = 0.95f;
-  
-  // 直接映射：pitch_deg -> torque_nm
-  // 调整这个系数来改变灵敏度
-    static const float KP = 0.0028f;
-    static const float KD = 0.0030f;
-    static const float KI = 0.000f; // KI = 0.00005f;
-
-    static const float MAX_TORQUE_NM = 0.5f;
-    static const float MAX_TILT_DEG = 45.0f;
-
-    static const float PITCH_DEADBAND_DEG = 0.8f;
-    static const float TORQUE_DEADBAND_NM = 0.015f;
-    static const float I_LIMIT = 20.0f;
-
-    static float pitch_i = 0.0f;
-    // Calibrated:
-    static float pitch_base_deg = 0.0f;
-    static float pitch_sum = 0.0f;
-    static uint16_t calib_cnt = 0;
-    static uint8_t calibrated = 0;
   while (1)
   {
-	  if (!loop_1khz_flag) continue;
+    if (!loop_1khz_flag) continue;
     loop_1khz_flag = 0;
+    loop_count++;
 
-    // 1) read IMU
-    BMI088_read(gyro, accel, &temp);
+    // Virtual torsional spring-damper between leader and follower.
+    float qL  = leader.pos_deg * DEG2RAD;
+    float qF  = follower.pos_deg * DEG2RAD;
+    float dqL = leader.vel_rpm * RPM2RAD;
+    float dqF = follower.vel_rpm * RPM2RAD;
 
-    // BMI088Middleware 输出 gyro单位=deg/s
-    float ax = accel[0];
-    float ay = accel[1];
-    float az = accel[2];
+    float err  = qL - qF;
+    float derr = dqL - dqF;
 
-    float gx = gyro[0];   // pitch rate
-    float gy = gyro[1];   // roll rate
-    float gz = gyro[2];   // yaw rate
+    float tau = -K_COUPLE * err - D_COUPLE * derr;
+    tau = clampf(tau, -TAU_MAX, TAU_MAX);
 
-    float roll_acc = atan2f(ax, sqrtf(ay*ay + az*az)) * RAD2DEG; 
-    float pitch_acc = atan2f(-ay, sqrtf(ax*ax + az*az)) * RAD2DEG;
+    int r1 = jc_set_torque_nm(&hfdcan1, NODE_LEADER, tau);
+    int r2 = jc_set_torque_nm(&hfdcan1, NODE_FOLLOWER, -tau);
 
-    // gyro[0] 是 pitch，用 -gx
-    float pitch_rate = -gx;
-
-    pitch_deg =
-        alpha * (pitch_deg + pitch_rate * dt)
-      + (1.0f - alpha) * pitch_acc;
-
-    // 直接用 pitch_deg 映射到扭矩，无校准无PID
-    //float torque_cmd = pitch_deg * KP;
-    if (!calibrated)
-    {
-        pitch_sum += pitch_deg;
-        calib_cnt++;
-
-        jc_set_torque_nm(&hfdcan1, NODE_LEFT_WHEEL, 0.0f);
-        jc_set_torque_nm(&hfdcan1, NODE_RIGHT_WHEEL, 0.0f);
-
-        if (calib_cnt >= 1000)
-        {
-            pitch_base_deg = pitch_sum / 1000.0f;
-            calibrated = 1;
-
-            logf_uart1("[CAL] pitch_base=%.2f\r\n", pitch_base_deg);
-        }
-
-        continue;
-    }
-
-    float pitch_err = pitch_deg - pitch_base_deg;
-
-    if (fabsf(pitch_err) > MAX_TILT_DEG)
-    {
-        pitch_i = 0.0f;
-
-        jc_set_torque_nm(&hfdcan1, NODE_LEFT_WHEEL, 0.0f);
-        jc_set_torque_nm(&hfdcan1, NODE_RIGHT_WHEEL, 0.0f);
-        continue;
-    }
-
-    float e = pitch_err;
-
-    // angle deadband
-    if (fabsf(e) < PITCH_DEADBAND_DEG)
-    {
-        e = 0.0f;
-    }
-    else if (e > 0.0f)
-    {
-        e -= PITCH_DEADBAND_DEG;
-    }
-    else
-    {
-        e += PITCH_DEADBAND_DEG;
-    }
-
-    // I term
-    pitch_i += e * dt;
-
-    if (pitch_i >  I_LIMIT) pitch_i =  I_LIMIT;
-    if (pitch_i < -I_LIMIT) pitch_i = -I_LIMIT;
-
-    // D term: gyro already gives pitch angular velocity
-    float pitch_d = pitch_rate;
-
-    // PID output
-    float torque_cmd =
-        KP * e
-        + KI * pitch_i
-        + KD * pitch_d;
-
-    // small torque deadband
-    if (fabsf(torque_cmd) < TORQUE_DEADBAND_NM)
-    {
-        torque_cmd = 0.0f;
-    }
-    // 限幅
-    if (torque_cmd >  MAX_TORQUE_NM) torque_cmd =  MAX_TORQUE_NM;
-    if (torque_cmd < -MAX_TORQUE_NM) torque_cmd = -MAX_TORQUE_NM;
-    
-    // 直接设置电机扭矩
-    int r1 = jc_set_torque_nm(&hfdcan1, NODE_LEFT_WHEEL, -torque_cmd);
-    int r2 = jc_set_torque_nm(&hfdcan1, NODE_RIGHT_WHEEL, torque_cmd);
-
-    neck_div++;
-    if (neck_div >= 20)
-    {
-        neck_div = 0;
-        jc_set_abs_pos_deg(&hfdcan1, NODE_NECK, 0.0f);
-    }
+    // 10Hz debug only. Do not print at 1kHz.
     uint32_t now = HAL_GetTick();
-    if ((now - last_50ms_log_ms) >= 100)
+    if ((now - last_log_ms) >= 100)
     {
-        last_50ms_log_ms = now;
+        uint32_t drx2 = leader.rx_count - last_rx2;
+        uint32_t drx3 = follower.rx_count - last_rx3;
+        last_rx2 = leader.rx_count;
+        last_rx3 = follower.rx_count;
+        last_log_ms = now;
 
         logf_uart1(
-            "P %.2f E %.2f I %.2f D %.2f T %.3f | r %d %d\r\n",
-            pitch_deg,
-            pitch_err,
-            pitch_i,
-            pitch_d,
-            torque_cmd,
+            "qL %.2f qF %.2f e %.2f tau %.3f | rx %lu %lu txdrop %lu r %d %d\r\n",
+            leader.pos_deg,
+            follower.pos_deg,
+            err * 57.2957795f,
+            tau,
+            (unsigned long)drx2,
+            (unsigned long)drx3,
+            (unsigned long)can_tx_drop,
             r1,
             r2
         );
     }
 
-
     /* USER CODE END WHILE */
+
 
     /* USER CODE BEGIN 3 */
   }
