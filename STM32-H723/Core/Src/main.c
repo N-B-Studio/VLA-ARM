@@ -38,8 +38,6 @@ typedef struct {
     uint32_t last_rx_ms;
 } JC_MotorState;
 
-// If your two gripper motors are actually ID 2/3, keep this.
-// If you changed them to ID 1/2, change these two only.
 #define NODE_LEADER    1 // mot1 on can 1
 #define NODE_FOLLOWER  2 // mot2 on can 2
 
@@ -59,21 +57,12 @@ static uint32_t can_tx_drop = 0;
 static uint32_t can_rx_other = 0;
 
 // virtual coupling gains
-/*
-static float K_COUPLE = 0.150f;     // Nm/rad
-static float D_COUPLE = 0.010f;    // Nm/(rad/s)
-static float TAU_MAX  = 0.15f;     // Nm, start small
+#define CTRL_DIV 1 // 1=1khz,2=500hz, 4=250hz, 10=100hz, 100=10hz,
 
-static float ERR_LPF_ALPHA = 0.03f;      // 0.03更稳，0.15更快
-static float DERR_LPF_ALPHA = 0.03f;     // 速度差更要重滤波
-static float TAU_LPF_ALPHA = 0.10f;      // torque低通
-static float TAU_RATE_LIMIT = 1.5f;      // Nm/s, 每秒最大变化
-*/
-#define CTRL_DIV 10 // 1=1khz,2=500hz, 4=250hz, 10=100hz, 100=10hz,
-static float TAU_MAX = 0.08f;
-static float K_TQ_FB = 0.30f;
-static float TQ_DEADBAND = 0.02f;
-static float TQ_LPF_ALPHA = 0.05f;
+static float K_COUPLE = 0.20f;
+static float D_COUPLE = 0.004f;
+static float TAU_MAX  = 0.15f;
+
 static const float DEG2RAD = 0.01745329252f;
 static const float RPM2RAD = 0.10471975512f;
 /* USER CODE END PV */
@@ -351,28 +340,19 @@ int main(void)
   if (jc_enter_closed_loop(&hfdcan2, NODE_FOLLOWER) != 0) fatal("closed follower");
   HAL_Delay(100);
 
-  /*
-  log_uart1("[INIT] torque mode\r\n");
-  if (jc_set_mode(&hfdcan1, NODE_LEADER, 0) != 0) fatal("mode0 leader");
-  HAL_Delay(100);
-  if (jc_set_mode(&hfdcan2, NODE_FOLLOWER, 0) != 0) fatal("mode0 follower");
-  HAL_Delay(100);
-
-  jc_set_torque_nm(&hfdcan1, NODE_LEADER, 0.0f);
-  HAL_Delay(20);
-  jc_set_torque_nm(&hfdcan2, NODE_FOLLOWER, 0.0f);
-  HAL_Delay(20);
-   */
-  //如果模式 4 不稳，再换成 _set_mode(..., 3); //  位置滤波模式
-  log_uart1("[INIT] leader torque free, follower position mode\r\n");
+  log_uart1("[INIT] both torque mode\r\n");
 
   jc_set_mode(&hfdcan1, NODE_LEADER, 0);
   HAL_Delay(100);
-  jc_set_torque_nm(&hfdcan1, NODE_LEADER, 0.0f);
+
+  jc_set_mode(&hfdcan2, NODE_FOLLOWER, 0);
   HAL_Delay(100);
 
-  jc_set_mode(&hfdcan2, NODE_FOLLOWER, 4);
-  HAL_Delay(100);
+  jc_set_torque_nm(&hfdcan1, NODE_LEADER, 0.0f);
+  HAL_Delay(20);
+
+  jc_set_torque_nm(&hfdcan2, NODE_FOLLOWER, 0.0f);
+  HAL_Delay(20);
 
 
   led_green();
@@ -395,29 +375,19 @@ int main(void)
         continue;
     }
 
-    static float tq_lpf = 0.0f;
+    float qL  = leader.pos_deg * DEG2RAD;
+    float qF  = follower.pos_deg * DEG2RAD;
+    float dqL = leader.vel_rpm * RPM2RAD;
+    float dqF = follower.vel_rpm * RPM2RAD;
 
-    float target_follower_deg = leader.pos_deg;
+    float err  = qL - qF;
+    float derr = dqL - dqF;
 
-    // follower 用位置模式跟随 leader
-    int r2 = jc_set_abs_pos_deg(&hfdcan2, NODE_FOLLOWER, target_follower_deg);
+    float tau = -K_COUPLE * err - D_COUPLE * derr;
+    tau = clampf(tau, -TAU_MAX, TAU_MAX);
 
-    // follower torque feedback 低通
-    float tq_raw = follower.torque_fb_nm;
-    tq_lpf += TQ_LPF_ALPHA * (tq_raw - tq_lpf);
-
-    // deadband，避免空载小抖动反馈到手上
-    float tq_contact = tq_lpf;
-    if (fabsf(tq_contact) < TQ_DEADBAND)
-    {
-        tq_contact = 0.0f;
-    }
-
-    // 给 leader 很小的力反馈
-    float tau_leader = K_TQ_FB * tq_contact;
-    tau_leader = clampf(tau_leader, -TAU_MAX, TAU_MAX);
-
-    int r1 = jc_set_torque_nm(&hfdcan1, NODE_LEADER, tau_leader);
+    int r1 = jc_set_torque_nm(&hfdcan1, NODE_LEADER, tau);
+    int r2 = jc_set_torque_nm(&hfdcan2, NODE_FOLLOWER, -tau);
 
     // 10Hz debug only. Do not print at 1kHz.
     uint32_t now = HAL_GetTick();
@@ -430,12 +400,13 @@ int main(void)
         last_log_ms = now;
 
         logf_uart1(
-            "qL %.2f qF %.2f tqF %.3f tqLPF %.3f tauL %.3f | rx %lu %lu r %d %d\r\n",
+            "qL %.2f qF %.2f e %.2f tau %.3f tqL %.3f tqF %.3f | rx %lu %lu r %d %d\r\n",
             leader.pos_deg,
             follower.pos_deg,
+            leader.pos_deg - follower.pos_deg,
+            tau,
+            leader.torque_fb_nm,
             follower.torque_fb_nm,
-            tq_lpf,
-            tau_leader,
             (unsigned long)drx2,
             (unsigned long)drx3,
             r1,
