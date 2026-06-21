@@ -1,0 +1,2 @@
+this is for temp test, use canable 2.0 with rock 5c. direct send can to both motor directly. 
+The reason to not use is due to 200ms lagging. and STM32 can provide as center node.
