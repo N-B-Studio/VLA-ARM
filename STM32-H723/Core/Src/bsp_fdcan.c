@@ -1,6 +1,6 @@
 #include "bsp_fdcan.h"
 
-extern void jc_parse_feedback(uint16_t rx_id, uint8_t *d, uint8_t len);
+extern void can_parse_feedback(uint16_t rx_id, uint8_t *d, uint8_t len);
 /**
 ************************************************************************
 * @brief:       bsp_can_init(void)
@@ -158,7 +158,7 @@ void fdcan1_rx_callback(void)
         uint8_t len = fdcanx_receive(&hfdcan1, &rec_id1, rx_data1);
         if (len > 0)
         {
-            jc_parse_feedback(rec_id1, rx_data1, len);
+            can_parse_feedback(rec_id1, rx_data1, len);
         }
     }
 }
@@ -173,7 +173,7 @@ void fdcan2_rx_callback(void)
         uint8_t len = fdcanx_receive(&hfdcan2, &rec_id2, rx_data2);
         if (len > 0)
         {
-            jc_parse_feedback(rec_id2, rx_data2, len);
+            can_parse_feedback(rec_id2, rx_data2, len);
         }
     }
 }

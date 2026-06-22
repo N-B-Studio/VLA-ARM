@@ -58,18 +58,8 @@ static uint32_t loop_count = 0;
 static uint32_t can_tx_drop = 0;
 static uint32_t can_rx_other = 0;
 
-#define CTRL_DIV 100   // 1=1kHz, 2=500Hz, 4=250Hz, 10=100Hz
+#define CTRL_DIV 1    // 1=1kHz, 2=500Hz, 4=250Hz, 10=100Hz
 
-// Start conservative. These are real Nm now if ODrive torque calibration is correct.
-static float K_COUPLE = 0.01f;     // Nm/rad
-static float D_COUPLE = 0.000f;    // Nm/(rad/s)
-static float TAU_MAX  = 0.01f;     // Nm
-
-// If direction is wrong, flip one or both signs.
-//static float LEADER_TORQUE_SIGN   =  1.0f;
-//static float FOLLOWER_TORQUE_SIGN = -1.0f;
-
-static const float TWO_PI = 6.28318530718f;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -111,13 +101,6 @@ static inline void arm_enable(uint8_t en)
     HAL_GPIO_WritePin(MOTOR_EN_PORT, MOTOR_EN_PIN_2, en ? GPIO_PIN_SET : GPIO_PIN_RESET);
 }
 
-static inline float clampf(float x, float lo, float hi)
-{
-    if (x > hi) return hi;
-    if (x < lo) return lo;
-    return x;
-}
-
 static uint32_t le_u32(const uint8_t *d)
 {
     return ((uint32_t)d[0]) | ((uint32_t)d[1] << 8) | ((uint32_t)d[2] << 16) | ((uint32_t)d[3] << 24);
@@ -137,13 +120,6 @@ static void put_u32_le(uint8_t *d, uint32_t v)
     d[1] = (uint8_t)((v >> 8) & 0xFF);
     d[2] = (uint8_t)((v >> 16) & 0xFF);
     d[3] = (uint8_t)((v >> 24) & 0xFF);
-}
-
-static void put_float_le(uint8_t *d, float f)
-{
-    uint32_t u;
-    memcpy(&u, &f, sizeof(float));
-    put_u32_le(d, u);
 }
 
 static inline uint16_t odrive_id(uint8_t node_id, uint8_t cmd_id)
@@ -183,15 +159,7 @@ static int odrive_set_controller_mode(FDCAN_HandleTypeDef *hcan, uint8_t node_id
     return odrive_send(hcan, node_id, 0x0B, d, 8);
 }
 
-static int odrive_set_input_torque(FDCAN_HandleTypeDef *hcan, uint8_t node_id, float torque_nm)
-{
-    torque_nm = clampf(torque_nm, -TAU_MAX, TAU_MAX);
-    uint8_t d[4];
-    put_float_le(d, torque_nm);
-    return odrive_send(hcan, node_id, 0x0E, d, 4);
-}
-
-void jc_parse_feedback(uint16_t rx_id, uint8_t *d, uint8_t len)  // called from bsp_fdcan.c
+void can_parse_feedback(uint16_t rx_id, uint8_t *d, uint8_t len)  // called from bsp_fdcan.c
 {
     if (len < 1) return;
 
@@ -245,8 +213,6 @@ static void fatal(const char *msg)
 {
     led_red();
     logf_uart1("[FATAL] %s\r\n", msg);
-    odrive_set_input_torque(&hfdcan1, NODE_LEADER, 0.0f);
-    odrive_set_input_torque(&hfdcan2, NODE_FOLLOWER, 0.0f);
     arm_enable(0);
     __disable_irq();
     while (1) { HAL_Delay(1000); }
@@ -274,7 +240,7 @@ int main(void)
 
   /* USER CODE BEGIN 2 */
   led_yellow();
-  log_uart1("\r\n[BOOT] ODrive 1kHz clean torque-coupling demo\r\n");
+  log_uart1("\r\n[BOOT] ODrive barebone CAN closed-loop demo\r\n");
 
   arm_enable(0);
   HAL_Delay(50);
@@ -298,22 +264,17 @@ int main(void)
   odrive_clear_errors(&hfdcan2, NODE_FOLLOWER);
   HAL_Delay(100);
 
-  log_uart1("[INIT] torque control + passthrough\r\n");
-  // Control_Mode=1 torque, Input_Mode=1 passthrough
-  if (odrive_set_controller_mode(&hfdcan1, NODE_LEADER, 1, 1) != 0) fatal("mode leader");
+  log_uart1("[INIT] position control + passthrough\r\n");
+  if (odrive_set_controller_mode(&hfdcan1, NODE_LEADER, 3, 1) != 0) fatal("mode leader");
   HAL_Delay(50);
-  if (odrive_set_controller_mode(&hfdcan2, NODE_FOLLOWER, 1, 1) != 0) fatal("mode follower");
+  if (odrive_set_controller_mode(&hfdcan2, NODE_FOLLOWER, 3, 1) != 0) fatal("mode follower");
   HAL_Delay(50);
 
   log_uart1("[INIT] closed loop\r\n");
-  // Axis_State=8 closed loop
   if (odrive_set_axis_state(&hfdcan1, NODE_LEADER, 8) != 0) fatal("closed leader");
   HAL_Delay(100);
   if (odrive_set_axis_state(&hfdcan2, NODE_FOLLOWER, 8) != 0) fatal("closed follower");
   HAL_Delay(100);
-
-  odrive_set_input_torque(&hfdcan1, NODE_LEADER, 0.0f);
-  odrive_set_input_torque(&hfdcan2, NODE_FOLLOWER, 0.0f);
 
   led_green();
   logf_uart1("[OK] running. leader=%d follower=%d\r\n", NODE_LEADER, NODE_FOLLOWER);
@@ -321,9 +282,6 @@ int main(void)
 
   /* USER CODE BEGIN WHILE */
   uint32_t last_log_ms = HAL_GetTick();
-  uint32_t last_enc_L = 0, last_enc_F = 0, last_hb_L = 0, last_hb_F = 0;
-  uint8_t zero_init = 0;
-  float zero_L = 0.0f, zero_F = 0.0f;
 
   while (1)
   {
@@ -332,68 +290,45 @@ int main(void)
     loop_count++;
     if ((loop_count % CTRL_DIV) != 0) continue;
 
-    if (!zero_init && leader.enc_count > 0 && follower.enc_count > 0) {
-        zero_L = leader.pos_turns;
-        zero_F = follower.pos_turns;
-        zero_init = 1;
-        logf_uart1("[ZERO] L %.4f F %.4f turns\r\n", zero_L, zero_F);
-    }
-
-    float tau = 0.0f;
-
-	float qL  = (leader.pos_turns - zero_L) * TWO_PI;
-	float qF  = (follower.pos_turns - zero_F) * TWO_PI;
-	float dqL = leader.vel_turns_s * TWO_PI;
-	float dqF = follower.vel_turns_s * TWO_PI;
-
-	// SimpleFOC haptic virtual spring:
-	// leader torque   = K * (follower - leader)
-	// follower torque = K * (leader - follower)
-	float tau_L = K_COUPLE * (qF - qL) + D_COUPLE * (dqF - dqL);
-	float tau_F = K_COUPLE * (qL - qF) + D_COUPLE * (dqL - dqF);
-
-	tau_L = clampf(tau_L, -TAU_MAX, TAU_MAX);
-	tau_F = clampf(tau_F, -TAU_MAX, TAU_MAX);
-
-	int r1 = odrive_set_input_torque(&hfdcan1, NODE_LEADER, tau_L);
-	int r2 = odrive_set_input_torque(&hfdcan2, NODE_FOLLOWER, tau_F);
-
+    // add contoller commands here if desired, e.g. to move the leader in open loop:
 
     uint32_t now = HAL_GetTick();
     if ((now - last_log_ms) >= 100)
     {
-        uint32_t dencL = leader.enc_count - last_enc_L;
-        uint32_t dencF = follower.enc_count - last_enc_F;
-        uint32_t dhbL  = leader.hb_count - last_hb_L;
-        uint32_t dhbF  = follower.hb_count - last_hb_F;
-        last_enc_L = leader.enc_count;
-        last_enc_F = follower.enc_count;
-        last_hb_L = leader.hb_count;
-        last_hb_F = follower.hb_count;
         last_log_ms = now;
 
-        float qL_deg = zero_init ? (leader.pos_turns - zero_L) * 360.0f : 0.0f;
-        float qF_deg = zero_init ? (follower.pos_turns - zero_F) * 360.0f : 0.0f;
-
+        // turn    = Encoder position (turns)
+        // deg     = Encoder position (degrees)
+        // vel     = Encoder velocity (turns/s)
+        // tq_cmd  = ODrive commanded torque (Nm)
+        // tq_est  = ODrive estimated output torque (Nm)
+        // st   = ODrive axis state (8 = CLOSED_LOOP)
+        // err     = ODrive axis error code (0 = OK)
+        // enc_rx  = Received encoder messages (cmd 0x09)
+        // tq_rx   = Received torque messages (cmd 0x1C)
         logf_uart1(
-            "qL %.2f qF %.2f e %.2f tau %.3f tqL %.3f tqF %.3f st %u %u err %08lX %08lX | enc %lu %lu hb %lu %lu drop %lu r %d %d\r\n",
-            qL_deg,
-            qF_deg,
-            qL_deg - qF_deg,
-            tau,
+            "L turn %.4f deg %.2f vel %.4f tqTarget %.4f tqEst %.4f st %u err %08lX enc %lu tq %lu | "
+            "F turn %.4f deg %.2f vel %.4f tqTarget %.4f tqEst %.4f st %u err %08lX enc %lu tq %lu\r\n",
+
+            leader.pos_turns,
+            leader.pos_turns * 360.0f,
+            leader.vel_turns_s,
+            leader.torque_target_nm,
             leader.torque_estimate_nm,
-            follower.torque_estimate_nm,
             leader.axis_state,
-            follower.axis_state,
             (unsigned long)leader.axis_error,
+            (unsigned long)leader.enc_count,
+            (unsigned long)leader.tq_count,
+
+            follower.pos_turns,
+            follower.pos_turns * 360.0f,
+            follower.vel_turns_s,
+            follower.torque_target_nm,
+            follower.torque_estimate_nm,
+            follower.axis_state,
             (unsigned long)follower.axis_error,
-            (unsigned long)dencL,
-            (unsigned long)dencF,
-            (unsigned long)dhbL,
-            (unsigned long)dhbF,
-            (unsigned long)can_tx_drop,
-            r1,
-            r2
+            (unsigned long)follower.enc_count,
+            (unsigned long)follower.tq_count
         );
     }
   }
