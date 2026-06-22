@@ -126,6 +126,9 @@ uint8_t fdcanx_receive(hcan_t *hfdcan, uint16_t *rec_id, uint8_t *buf)
     if (HAL_FDCAN_GetRxMessage(hfdcan, FDCAN_RX_FIFO0, &rx, payload) != HAL_OK)
         return 0;
 
+    if (rx.IdType != FDCAN_STANDARD_ID)
+        return 0;
+
     if (rec_id) *rec_id = (uint16_t)rx.Identifier;
 
     uint8_t len = 8;

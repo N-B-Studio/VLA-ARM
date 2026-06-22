@@ -43,8 +43,8 @@ typedef struct {
     uint32_t last_rx_ms;
 } ODriveState;
 
-#define NODE_LEADER    2   // motor on CAN1
-#define NODE_FOLLOWER  1   // motor on CAN2
+#define NODE_LEADER    1   // motor on CAN1
+#define NODE_FOLLOWER  2   // motor on CAN2
 
 static ODriveState leader   = {NODE_LEADER,   0};
 static ODriveState follower = {NODE_FOLLOWER, 0};
@@ -250,6 +250,7 @@ int main(void)
   HAL_Delay(50);
 
   HAL_FDCAN_ActivateNotification(&hfdcan1, FDCAN_IT_RX_FIFO0_NEW_MESSAGE, 0);
+  HAL_Delay(50);
   HAL_FDCAN_ActivateNotification(&hfdcan2, FDCAN_IT_RX_FIFO0_NEW_MESSAGE, 0);
 
   HAL_TIM_Base_Start_IT(&htim2);
@@ -260,7 +261,7 @@ int main(void)
 
   log_uart1("[INIT] clear errors\r\n");
   odrive_clear_errors(&hfdcan1, NODE_LEADER);
-  HAL_Delay(20);
+  HAL_Delay(50);
   odrive_clear_errors(&hfdcan2, NODE_FOLLOWER);
   HAL_Delay(100);
 
