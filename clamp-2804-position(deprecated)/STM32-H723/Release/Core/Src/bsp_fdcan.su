@@ -1,0 +1,7 @@
+../Core/Src/bsp_fdcan.c:28:6:can_filter_init	56	static
+../Core/Src/bsp_fdcan.c:10:6:bsp_can_init	16	static
+../Core/Src/bsp_fdcan.c:64:9:fdcanx_send_data	72	static
+../Core/Src/bsp_fdcan.c:116:9:fdcanx_receive	64	static
+../Core/Src/bsp_fdcan.c:151:6:fdcan1_rx_callback	0	static
+../Core/Src/bsp_fdcan.c:157:6:fdcan2_rx_callback	0	static
+../Core/Src/bsp_fdcan.c:169:6:HAL_FDCAN_RxFifo0Callback	8	static
