@@ -33,7 +33,6 @@ typedef struct {
     uint8_t node_id;
     float pos_deg;
     float vel_rpm;
-    float torque_fb_nm;
     uint32_t rx_count;
     uint32_t last_rx_ms;
 } JC_MotorState;
@@ -59,9 +58,9 @@ static uint32_t can_rx_other = 0;
 // virtual coupling gains
 #define CTRL_DIV 1 // 1=1khz,2=500hz, 4=250hz, 10=100hz, 100=10hz,
 
-static float K_COUPLE = 0.20f;
-static float D_COUPLE = 0.004f;
-static float TAU_MAX  = 0.15f;
+static float K_COUPLE = 0.18f;
+static float D_COUPLE = 0.015f;
+static float TAU_MAX  = 0.25f;
 
 static const float DEG2RAD = 0.01745329252f;
 static const float RPM2RAD = 0.10471975512f;
@@ -169,25 +168,7 @@ static int jc_set_torque_nm(FDCAN_HandleTypeDef *hcan, uint8_t node_id, float to
     return jc_send8(hcan, jc_tx_id(node_id), d);
 }
 
-static int jc_set_abs_pos_deg(FDCAN_HandleTypeDef *hcan, uint8_t node_id, float pos_deg)
-{
-    int32_t v = (int32_t)(pos_deg * 100.0f); // JC: deg * 100
-
-    uint8_t d[8] = {
-        0x23,
-        0x00,
-        0x23,
-        0x00,
-        (uint8_t)((v >> 24) & 0xFF),
-        (uint8_t)((v >> 16) & 0xFF),
-        (uint8_t)((v >> 8) & 0xFF),
-        (uint8_t)(v & 0xFF)
-    };
-
-    return jc_send8(hcan, jc_tx_id(node_id), d);
-}
-
-void jc_parse_feedback(uint16_t rx_id, uint8_t *d, uint8_t len)
+void can_parse_feedback(uint16_t rx_id, uint8_t *d, uint8_t len)
 {
     if (len != 8) return;
 
@@ -212,11 +193,9 @@ void jc_parse_feedback(uint16_t rx_id, uint8_t *d, uint8_t len)
     if (d[0] == 0x2A) {
         int32_t pos_raw = be_s24(&d[1]);
         int16_t vel_raw = be_s16(&d[4]);
-        int16_t tq_raw  = be_s16(&d[6]);
 
         m->pos_deg = (float)pos_raw / 100.0f;
         m->vel_rpm = (float)vel_raw / 100.0f;
-        m->torque_fb_nm = (float)tq_raw / 100.0f;
         m->rx_count++;
         m->last_rx_ms = HAL_GetTick();
     }
@@ -229,47 +208,6 @@ static void fatal(const char *msg)
     arm_enable(0);
     __disable_irq();
     while (1) { HAL_Delay(1000); }
-}
-
-static void jc_scan_bus(FDCAN_HandleTypeDef *hcan, const char *name)
-{
-    logf_uart1("\r\n[SCAN] %s start\r\n", name);
-
-    uint8_t d[8] = {0x4B, 0x00, 0x04, 0x00, 0, 0, 0, 0};
-
-    for (uint8_t id = 1; id <= 127; id++)
-    {
-        uint16_t txid = 0x600 + id;
-
-        uint32_t rx_before_leader = leader.rx_count;
-        uint32_t rx_before_follower = follower.rx_count;
-
-        uint8_t r = fdcanx_send_data(hcan, txid, d, 8);
-
-        HAL_Delay(8);
-
-        logf_uart1("[SCAN] %s send node=%u txid=0x%03X r=%u\r\n",
-                   name, id, txid, r);
-
-        if (leader.rx_count != rx_before_leader)
-        {
-            logf_uart1("[FOUND] %s node=%u as leader reply\r\n", name, id);
-        }
-
-        if (follower.rx_count != rx_before_follower)
-        {
-            logf_uart1("[FOUND] %s node=%u as follower reply\r\n", name, id);
-        }
-    }
-
-    logf_uart1("[SCAN] %s done\r\n", name);
-}
-
-static float wrap_deg_180(float x)
-{
-    while (x > 180.0f)  x -= 360.0f;
-    while (x < -180.0f) x += 360.0f;
-    return x;
 }
 /* USER CODE END 0 */
 
@@ -320,7 +258,7 @@ int main(void)
 
   // If bsp_can_init() does not already enable RX interrupt, this makes it explicit.
   HAL_FDCAN_ActivateNotification(&hfdcan1, FDCAN_IT_RX_FIFO0_NEW_MESSAGE, 0);
-  HAL_FDCAN_ActivateNotification(&hfdcan2, FDCAN_IT_RX_FIFO0_NEW_MESSAGE, 0);
+  HAL_FDCAN_ActivateNotification(&hfdcan1, FDCAN_IT_RX_FIFO0_NEW_MESSAGE, 0);
 
   HAL_TIM_Base_Start_IT(&htim2);
 
@@ -331,13 +269,13 @@ int main(void)
   log_uart1("[INIT] idle motors\r\n");
   jc_idle(&hfdcan1, NODE_LEADER);
   HAL_Delay(100);
-  jc_idle(&hfdcan2, NODE_FOLLOWER);
+  jc_idle(&hfdcan1, NODE_FOLLOWER);
   HAL_Delay(100);
 
   log_uart1("[INIT] closed loop\r\n");
   if (jc_enter_closed_loop(&hfdcan1, NODE_LEADER) != 0) fatal("closed leader");
   HAL_Delay(100);
-  if (jc_enter_closed_loop(&hfdcan2, NODE_FOLLOWER) != 0) fatal("closed follower");
+  if (jc_enter_closed_loop(&hfdcan1, NODE_FOLLOWER) != 0) fatal("closed follower");
   HAL_Delay(100);
 
   log_uart1("[INIT] both torque mode\r\n");
@@ -345,13 +283,13 @@ int main(void)
   jc_set_mode(&hfdcan1, NODE_LEADER, 0);
   HAL_Delay(100);
 
-  jc_set_mode(&hfdcan2, NODE_FOLLOWER, 0);
+  jc_set_mode(&hfdcan1, NODE_FOLLOWER, 0);
   HAL_Delay(100);
 
   jc_set_torque_nm(&hfdcan1, NODE_LEADER, 0.0f);
   HAL_Delay(20);
 
-  jc_set_torque_nm(&hfdcan2, NODE_FOLLOWER, 0.0f);
+  jc_set_torque_nm(&hfdcan1, NODE_FOLLOWER, 0.0f);
   HAL_Delay(20);
 
 
@@ -364,6 +302,7 @@ int main(void)
   /* USER CODE BEGIN WHILE */
   uint32_t last_log_ms = HAL_GetTick();
   uint32_t last_rx2 = 0, last_rx3 = 0;
+  float last_err_deg = 0.0f;
 
   while (1)
   {
@@ -375,19 +314,29 @@ int main(void)
         continue;
     }
 
+    float err_deg = leader.pos_deg - follower.pos_deg;
+    if(err_deg < 1.0f && err_deg > -1.0f)
+    {
+        err_deg = last_err_deg;
+    }
+        else
+        {
+        last_err_deg = err_deg;
+    }
+
     float qL  = leader.pos_deg * DEG2RAD;
     float qF  = follower.pos_deg * DEG2RAD;
     float dqL = leader.vel_rpm * RPM2RAD;
     float dqF = follower.vel_rpm * RPM2RAD;
 
-    float err  = qL - qF;
+    float err  = err_deg * DEG2RAD;
     float derr = dqL - dqF;
 
     float tau = -K_COUPLE * err - D_COUPLE * derr;
     tau = clampf(tau, -TAU_MAX, TAU_MAX);
 
-    int r1 = jc_set_torque_nm(&hfdcan1, NODE_LEADER, tau);
-    int r2 = jc_set_torque_nm(&hfdcan2, NODE_FOLLOWER, -tau);
+    int r1 = jc_set_torque_nm(&hfdcan1, NODE_LEADER, 0.9f * tau);
+    int r2 = jc_set_torque_nm(&hfdcan1, NODE_FOLLOWER, -tau);
 
     // 10Hz debug only. Do not print at 1kHz.
     uint32_t now = HAL_GetTick();
@@ -400,13 +349,11 @@ int main(void)
         last_log_ms = now;
 
         logf_uart1(
-            "qL %.2f qF %.2f e %.2f tau %.3f tqL %.3f tqF %.3f | rx %lu %lu r %d %d\r\n",
+            "qL %.2f qF %.2f e %.2f tau %.3f | rx %lu %lu r %d %d\r\n",
             leader.pos_deg,
             follower.pos_deg,
-            leader.pos_deg - follower.pos_deg,
+            err,
             tau,
-            leader.torque_fb_nm,
-            follower.torque_fb_nm,
             (unsigned long)drx2,
             (unsigned long)drx3,
             r1,

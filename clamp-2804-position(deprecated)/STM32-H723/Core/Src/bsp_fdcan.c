@@ -1,6 +1,6 @@
 #include "bsp_fdcan.h"
 
-extern void jc_parse_feedback(uint16_t rx_id, uint8_t *d, uint8_t len);
+extern void can_parse_feedback(uint16_t rx_id, uint8_t *d, uint8_t len);
 /**
 ************************************************************************
 * @brief:       bsp_can_init(void)
@@ -126,6 +126,9 @@ uint8_t fdcanx_receive(hcan_t *hfdcan, uint16_t *rec_id, uint8_t *buf)
     if (HAL_FDCAN_GetRxMessage(hfdcan, FDCAN_RX_FIFO0, &rx, payload) != HAL_OK)
         return 0;
 
+    if (rx.IdType != FDCAN_STANDARD_ID)
+        return 0;
+
     if (rec_id) *rec_id = (uint16_t)rx.Identifier;
 
     uint8_t len = 8;
@@ -153,10 +156,13 @@ uint16_t rec_id1;
 
 void fdcan1_rx_callback(void)
 {
-    uint8_t len = fdcanx_receive(&hfdcan1, &rec_id1, rx_data1);
-    if (len > 0)
+    while (HAL_FDCAN_GetRxFifoFillLevel(&hfdcan1, FDCAN_RX_FIFO0) > 0)
     {
-        jc_parse_feedback(rec_id1, rx_data1, len);
+        uint8_t len = fdcanx_receive(&hfdcan1, &rec_id1, rx_data1);
+        if (len > 0)
+        {
+            can_parse_feedback(rec_id1, rx_data1, len);
+        }
     }
 }
 
@@ -165,10 +171,13 @@ uint16_t rec_id2;
 
 void fdcan2_rx_callback(void)
 {
-    uint8_t len = fdcanx_receive(&hfdcan2, &rec_id2, rx_data2);
-    if (len > 0)
+    while (HAL_FDCAN_GetRxFifoFillLevel(&hfdcan2, FDCAN_RX_FIFO0) > 0)
     {
-        jc_parse_feedback(rec_id2, rx_data2, len);
+        uint8_t len = fdcanx_receive(&hfdcan2, &rec_id2, rx_data2);
+        if (len > 0)
+        {
+            can_parse_feedback(rec_id2, rx_data2, len);
+        }
     }
 }
 //uint8_t rx_data3[8] = {0};

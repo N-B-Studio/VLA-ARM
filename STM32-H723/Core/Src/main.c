@@ -31,38 +31,39 @@
 /* USER CODE BEGIN PM */
 typedef struct {
     uint8_t node_id;
-    float pos_turns;
-    float vel_turns_s;
-    float torque_target_nm;
-    float torque_estimate_nm;
-    uint32_t axis_error;
-    uint8_t axis_state;
-    uint32_t hb_count;
-    uint32_t enc_count;
-    uint32_t tq_count;
+    float pos_deg;
+    float vel_rpm;
+    uint32_t rx_count;
     uint32_t last_rx_ms;
-} ODriveState;
+} JC_MotorState;
 
-#define NODE_LEADER    1   // motor on CAN1
-#define NODE_FOLLOWER  2   // motor on CAN2
+#define NODE_LEADER    1 // mot1 on can 1
+#define NODE_FOLLOWER  2 // mot2 on can 2
 
-static ODriveState leader   = {NODE_LEADER,   0};
-static ODriveState follower = {NODE_FOLLOWER, 0};
+static JC_MotorState leader   = {NODE_LEADER,   0};
+static JC_MotorState follower = {NODE_FOLLOWER, 0};
 /* USER CODE END PM */
 
 /* Private variables ---------------------------------------------------------*/
 
 /* USER CODE BEGIN PV */
+// 1kHz control flag from TIM2
 volatile uint8_t loop_1khz_flag = 0;
+
+// timing/debug
 static uint32_t loop_count = 0;
 static uint32_t can_tx_drop = 0;
 static uint32_t can_rx_other = 0;
 
-#define CTRL_DIV 10   // 1=1kHz, 2=500Hz, 4=250Hz, 10=100Hz
+// virtual coupling gains
+#define CTRL_DIV 1 // 1=1khz,2=500hz, 4=250hz, 10=100hz, 100=10hz,
 
-//static float TAU_MAX = 0.050f;
+static float K_COUPLE = 0.18f;
+static float D_COUPLE = 0.015f;
+static float TAU_MAX  = 0.25f;
 
-
+static const float DEG2RAD = 0.01745329252f;
+static const float RPM2RAD = 0.10471975512f;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -72,11 +73,13 @@ void SystemClock_Config(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+// ===== WS2812 LED status helpers =====
 static inline void led_yellow(void){ WS2812_Ctrl(60, 60, 0); }
 static inline void led_red(void)   { WS2812_Ctrl(80, 0, 0);  }
 static inline void led_green(void) { WS2812_Ctrl(0, 80, 0);  }
 
-static char logbuf[224];
+// ===== UART1 logging =====
+static char logbuf[192];
 
 static void log_uart1(const char *s)
 {
@@ -94,6 +97,7 @@ static void logf_uart1(const char *fmt, ...)
     HAL_UART_Transmit(&huart1, (uint8_t*)logbuf, (uint16_t)len, 100);
 }
 
+// ===== Power 1 enable: PC14 =====
 #define MOTOR_EN_PORT GPIOC
 #define MOTOR_EN_PIN_1  GPIO_PIN_14
 #define MOTOR_EN_PIN_2  GPIO_PIN_13
@@ -104,111 +108,96 @@ static inline void arm_enable(uint8_t en)
     HAL_GPIO_WritePin(MOTOR_EN_PORT, MOTOR_EN_PIN_2, en ? GPIO_PIN_SET : GPIO_PIN_RESET);
 }
 
-static uint32_t le_u32(const uint8_t *d)
+// ===== JC protocol helpers =====
+static inline uint16_t jc_tx_id(uint8_t node_id){ return (uint16_t)(0x600 + node_id); }
+
+static inline float clampf(float x, float lo, float hi)
 {
-    return ((uint32_t)d[0]) | ((uint32_t)d[1] << 8) | ((uint32_t)d[2] << 16) | ((uint32_t)d[3] << 24);
+    if (x > hi) return hi;
+    if (x < lo) return lo;
+    return x;
 }
 
-static float le_float(const uint8_t *d)
+static inline int16_t be_s16(const uint8_t *p)
 {
-    float f;
-    uint32_t u = le_u32(d);
-    memcpy(&f, &u, sizeof(float));
-    return f;
+    return (int16_t)((uint16_t)p[0] << 8 | p[1]);
 }
 
-static void put_u32_le(uint8_t *d, uint32_t v)
+static inline int32_t be_s24(const uint8_t *p)
 {
-    d[0] = (uint8_t)(v & 0xFF);
-    d[1] = (uint8_t)((v >> 8) & 0xFF);
-    d[2] = (uint8_t)((v >> 16) & 0xFF);
-    d[3] = (uint8_t)((v >> 24) & 0xFF);
+    int32_t v = ((int32_t)p[0] << 16) | ((int32_t)p[1] << 8) | p[2];
+    if (v & 0x00800000) v |= 0xFF000000;
+    return v;
 }
 
-static inline uint16_t odrive_id(uint8_t node_id, uint8_t cmd_id)
+static int jc_send8(FDCAN_HandleTypeDef *hcan, uint16_t std_id, const uint8_t d[8])
 {
-    return (uint16_t)((node_id << 5) | (cmd_id & 0x1F));
-}
-
-static int odrive_send(FDCAN_HandleTypeDef *hcan, uint8_t node_id, uint8_t cmd_id, const uint8_t *data, uint32_t len)
-{
-    uint8_t payload[8] = {0};
-    if (data && len > 0) {
-        if (len > 8) len = 8;
-        memcpy(payload, data, len);
-    }
-    int r = fdcanx_send_data(hcan, odrive_id(node_id, cmd_id), payload, len);
+    int r = fdcanx_send_data(hcan, std_id, (uint8_t*)d, 8);
     if (r != 0) can_tx_drop++;
     return r;
 }
 
-static int odrive_clear_errors(FDCAN_HandleTypeDef *hcan, uint8_t node_id)
+static int jc_set_mode(FDCAN_HandleTypeDef *hcan, uint8_t node_id, uint16_t mode)
 {
-    return odrive_send(hcan, node_id, 0x18, NULL, 0);
+    uint8_t d[8] = {0x2B, 0x00, 0x60, 0x00, 0, 0, 0, 0};
+    d[4] = (uint8_t)(mode >> 8);
+    d[5] = (uint8_t)(mode & 0xFF);
+    return jc_send8(hcan, jc_tx_id(node_id), d);
 }
 
-static int odrive_set_axis_state(FDCAN_HandleTypeDef *hcan, uint8_t node_id, uint32_t state)
+static int jc_enter_closed_loop(FDCAN_HandleTypeDef *hcan, uint8_t node_id)
 {
-    uint8_t d[4];
-    put_u32_le(d, state);
-    return odrive_send(hcan, node_id, 0x07, d, 4);
+    uint8_t d[8] = {0x2B, 0x00, 0xA2, 0x00, 0x00, 0x01, 0x00, 0x00};
+    return jc_send8(hcan, jc_tx_id(node_id), d);
 }
 
-static int odrive_set_controller_mode(FDCAN_HandleTypeDef *hcan, uint8_t node_id, uint32_t control_mode, uint32_t input_mode)
+static int jc_idle(FDCAN_HandleTypeDef *hcan, uint8_t node_id)
 {
-    uint8_t d[8];
-    put_u32_le(&d[0], control_mode);
-    put_u32_le(&d[4], input_mode);
-    return odrive_send(hcan, node_id, 0x0B, d, 8);
+    uint8_t d[8] = {0x2B, 0x00, 0xA0, 0x00, 0x00, 0x01, 0x00, 0x00};
+    return jc_send8(hcan, jc_tx_id(node_id), d);
 }
 
-void can_parse_feedback(uint16_t rx_id, uint8_t *d, uint8_t len)  // called from bsp_fdcan.c
+static int jc_set_torque_nm(FDCAN_HandleTypeDef *hcan, uint8_t node_id, float torque_nm)
 {
-    if (len < 1) return;
+    torque_nm = clampf(torque_nm, -TAU_MAX, TAU_MAX);
+    int16_t v = (int16_t)(torque_nm * 100.0f); // JC: Nm * 100
 
-    uint8_t node = (uint8_t)(rx_id >> 5);
-    uint8_t cmd  = (uint8_t)(rx_id & 0x1F);
+    uint8_t d[8] = {0x2B, 0x00, 0x20, 0x00, 0, 0, 0, 0};
+    d[4] = (uint8_t)((v >> 8) & 0xFF);
+    d[5] = (uint8_t)(v & 0xFF);
+    return jc_send8(hcan, jc_tx_id(node_id), d);
+}
 
-    ODriveState *m = NULL;
-    if (node == NODE_LEADER) {
+void can_parse_feedback(uint16_t rx_id, uint8_t *d, uint8_t len)
+{
+    if (len != 8) return;
+
+    uint8_t node = 0;
+    JC_MotorState *m = NULL;
+
+    if (rx_id == (0x580 + NODE_LEADER)) {
+        node = NODE_LEADER;
         m = &leader;
-    } else if (node == NODE_FOLLOWER) {
+    } else if (rx_id == (0x580 + NODE_FOLLOWER)) {
+        node = NODE_FOLLOWER;
         m = &follower;
     } else {
         can_rx_other++;
         return;
     }
 
-    switch (cmd) {
-        case 0x01: // Heartbeat: Axis_Error uint32, Axis_State uint8 at byte 4
-            if (len >= 8) {
-                m->axis_error = le_u32(&d[0]);
-                m->axis_state = d[4];
-                m->hb_count++;
-                m->last_rx_ms = HAL_GetTick();
-            }
-            break;
+    (void)node;
 
-        case 0x09: // Get_Encoder_Estimates: pos turns, vel turns/s
-            if (len >= 8) {
-                m->pos_turns = le_float(&d[0]);
-                m->vel_turns_s = le_float(&d[4]);
-                m->enc_count++;
-                m->last_rx_ms = HAL_GetTick();
-            }
-            break;
+    // Torque/position/speed command reply:
+    // 2A [pos 24-bit, deg*100] [speed 16-bit, rpm*100] [current/torque 16-bit, *100]
+    if (d[0] == 0x2A) {
+        int32_t pos_raw = be_s24(&d[1]);
+        int16_t vel_raw = be_s16(&d[4]);
 
-        case 0x1C: // Get_Torques: target Nm, estimate Nm. Only if enabled/requested.
-            if (len >= 8) {
-                m->torque_target_nm = le_float(&d[0]);
-                m->torque_estimate_nm = le_float(&d[4]);
-                m->tq_count++;
-                m->last_rx_ms = HAL_GetTick();
-            }
-            break;
-
-        default:
-            break;
+        m->pos_deg = (float)pos_raw / 100.0f;
+        m->vel_rpm = (float)vel_raw / 100.0f;
+        m->rx_count++;
+        m->last_rx_ms = HAL_GetTick();
     }
 }
 
@@ -220,39 +209,6 @@ static void fatal(const char *msg)
     __disable_irq();
     while (1) { HAL_Delay(1000); }
 }
-
-static inline float clampf(float x, float lo, float hi)
-{
-    if (x > hi) return hi;
-    if (x < lo) return lo;
-    return x;
-}
-
-static void put_float_le(uint8_t *d, float f)
-{
-    uint32_t u;
-    memcpy(&u, &f, sizeof(float));
-    put_u32_le(d, u);
-}
-
-/*
-static int odrive_set_input_torque(FDCAN_HandleTypeDef *hcan, uint8_t node_id, float torque_nm)
-{
-    torque_nm = clampf(torque_nm, -TAU_MAX, TAU_MAX);
-
-    uint8_t d[4];
-    put_float_le(d, torque_nm);
-
-    return odrive_send(hcan, node_id, 0x0E, d, 4);
-}
-*/
-static int odrive_set_input_pos(FDCAN_HandleTypeDef *hcan, uint8_t node_id, float pos_turns)
-{
-    uint8_t d[8] = {0};
-    put_float_le(&d[0], pos_turns);   // input_pos, turns
-    return odrive_send(hcan, node_id, 0x0C, d, 8);
-}
-
 /* USER CODE END 0 */
 
 /**
@@ -261,9 +217,25 @@ static int odrive_set_input_pos(FDCAN_HandleTypeDef *hcan, uint8_t node_id, floa
   */
 int main(void)
 {
+
+  /* USER CODE BEGIN 1 */
+  /* USER CODE END 1 */
+
+  /* MCU Configuration--------------------------------------------------------*/
+
+  /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
   HAL_Init();
+
+  /* USER CODE BEGIN Init */
+  /* USER CODE END Init */
+
+  /* Configure the system clock */
   SystemClock_Config();
 
+  /* USER CODE BEGIN SysInit */
+  /* USER CODE END SysInit */
+
+  /* Initialize all configured peripherals */
   MX_GPIO_Init();
   MX_DMA_Init();
   MX_SPI2_Init();
@@ -273,10 +245,9 @@ int main(void)
   MX_FDCAN2_Init();
   MX_USART10_UART_Init();
   MX_SPI6_Init();
-
   /* USER CODE BEGIN 2 */
   led_yellow();
-  log_uart1("\r\n[BOOT] ODrive barebone CAN closed-loop demo\r\n");
+  log_uart1("\r\n[BOOT] H725/H723 JC gripper 1kHz force-feedback demo\r\n");
 
   arm_enable(0);
   HAL_Delay(50);
@@ -285,9 +256,9 @@ int main(void)
   bsp_can_init();
   HAL_Delay(50);
 
+  // If bsp_can_init() does not already enable RX interrupt, this makes it explicit.
   HAL_FDCAN_ActivateNotification(&hfdcan1, FDCAN_IT_RX_FIFO0_NEW_MESSAGE, 0);
-  HAL_Delay(50);
-  HAL_FDCAN_ActivateNotification(&hfdcan2, FDCAN_IT_RX_FIFO0_NEW_MESSAGE, 0);
+  HAL_FDCAN_ActivateNotification(&hfdcan1, FDCAN_IT_RX_FIFO0_NEW_MESSAGE, 0);
 
   HAL_TIM_Base_Start_IT(&htim2);
 
@@ -295,87 +266,107 @@ int main(void)
   arm_enable(1);
   HAL_Delay(500);
 
-  log_uart1("[INIT] clear errors\r\n");
-  odrive_clear_errors(&hfdcan1, NODE_LEADER);
-  HAL_Delay(50);
-  odrive_clear_errors(&hfdcan2, NODE_FOLLOWER);
+  log_uart1("[INIT] idle motors\r\n");
+  jc_idle(&hfdcan1, NODE_LEADER);
   HAL_Delay(100);
-
-  log_uart1("[INIT] position control + passthrough\r\n");
-
-  if (odrive_set_controller_mode(&hfdcan1, NODE_LEADER, 3, 1) != 0) fatal("mode leader");
-  HAL_Delay(50);
-  if (odrive_set_controller_mode(&hfdcan2, NODE_FOLLOWER, 3, 1) != 0) fatal("mode follower");
-  HAL_Delay(50);
+  jc_idle(&hfdcan1, NODE_FOLLOWER);
+  HAL_Delay(100);
 
   log_uart1("[INIT] closed loop\r\n");
-  if (odrive_set_axis_state(&hfdcan1, NODE_LEADER, 8) != 0) fatal("closed leader");
+  if (jc_enter_closed_loop(&hfdcan1, NODE_LEADER) != 0) fatal("closed leader");
   HAL_Delay(100);
-  if (odrive_set_axis_state(&hfdcan2, NODE_FOLLOWER, 8) != 0) fatal("closed follower");
+  if (jc_enter_closed_loop(&hfdcan1, NODE_FOLLOWER) != 0) fatal("closed follower");
   HAL_Delay(100);
+
+  log_uart1("[INIT] both torque mode\r\n");
+
+  jc_set_mode(&hfdcan1, NODE_LEADER, 0);
+  HAL_Delay(100);
+
+  jc_set_mode(&hfdcan1, NODE_FOLLOWER, 0);
+  HAL_Delay(100);
+
+  jc_set_torque_nm(&hfdcan1, NODE_LEADER, 0.0f);
+  HAL_Delay(20);
+
+  jc_set_torque_nm(&hfdcan1, NODE_FOLLOWER, 0.0f);
+  HAL_Delay(20);
+
 
   led_green();
-  logf_uart1("[OK] running. leader=%d follower=%d\r\n", NODE_LEADER, NODE_FOLLOWER);
+  logf_uart1("[OK] 1kHz demo running. leader=%d follower=%d\r\n", NODE_LEADER, NODE_FOLLOWER);
+  led_green();
   /* USER CODE END 2 */
 
+  /* Infinite loop */
   /* USER CODE BEGIN WHILE */
+  uint32_t last_log_ms = HAL_GetTick();
+  uint32_t last_rx2 = 0, last_rx3 = 0;
+  float last_err_deg = 0.0f;
 
   while (1)
   {
     if (!loop_1khz_flag) continue;
     loop_1khz_flag = 0;
     loop_count++;
-    if ((loop_count % CTRL_DIV) != 0) continue;
-
-    // ================ Main control loop start =================
-
-    uint32_t now_ms = HAL_GetTick();
-
-    uint8_t can_ok =
-        (leader.axis_state == 8) &&
-        (follower.axis_state == 8) &&
-        ((now_ms - leader.last_rx_ms) < 150) &&
-        ((now_ms - follower.last_rx_ms) < 250);
-
-    int r1 = 0;
-    int r2 = 0;
-
-    if (can_ok && leader.enc_count > 0 && follower.enc_count > 0)
+    if ((loop_count % CTRL_DIV) != 0)
     {
-        r1 = odrive_set_input_pos(&hfdcan1, NODE_LEADER, follower.pos_turns);
-        r2 = odrive_set_input_pos(&hfdcan2, NODE_FOLLOWER, leader.pos_turns);
+        continue;
     }
 
-    // ================ Main control loop end ===================
+    float err_deg = leader.pos_deg - follower.pos_deg;
+    if(err_deg < 1.0f && err_deg > -1.0f)
+    {
+        err_deg = last_err_deg;
+    }
+        else
+        {
+        last_err_deg = err_deg;
+    }
 
+    float qL  = leader.pos_deg * DEG2RAD;
+    float qF  = follower.pos_deg * DEG2RAD;
+    float dqL = leader.vel_rpm * RPM2RAD;
+    float dqF = follower.vel_rpm * RPM2RAD;
+
+    float err  = err_deg * DEG2RAD;
+    float derr = dqL - dqF;
+
+    float tau = -K_COUPLE * err - D_COUPLE * derr;
+    tau = clampf(tau, -TAU_MAX, TAU_MAX);
+
+    int r1 = jc_set_torque_nm(&hfdcan1, NODE_LEADER, 0.9f * tau);
+    int r2 = jc_set_torque_nm(&hfdcan1, NODE_FOLLOWER, -tau);
+
+    // 10Hz debug only. Do not print at 1kHz.
     uint32_t now = HAL_GetTick();
+    if ((now - last_log_ms) >= 100)
+    {
+        uint32_t drx2 = leader.rx_count - last_rx2;
+        uint32_t drx3 = follower.rx_count - last_rx3;
+        last_rx2 = leader.rx_count;
+        last_rx3 = follower.rx_count;
+        last_log_ms = now;
 
-    logf_uart1(
-        "L %.2fdeg v %.3f tqEst %.4f st %u age %lu | "
-        "F %.2fdeg v %.3f tqEst %.4f st %u age %lu | "
-        "enc %lu/%lu tq %lu/%lu r %d/%d\r\n",
+        logf_uart1(
+            "qL %.2f qF %.2f e %.2f tau %.3f | rx %lu %lu r %d %d\r\n",
+            leader.pos_deg,
+            follower.pos_deg,
+            err,
+            tau,
+            (unsigned long)drx2,
+            (unsigned long)drx3,
+            r1,
+            r2
+        );
+    }
 
-        leader.pos_turns * 360.0f,
-        leader.vel_turns_s,
-        leader.torque_estimate_nm,
-        leader.axis_state,
-        (unsigned long)(now - leader.last_rx_ms),
+    /* USER CODE END WHILE */
 
-        follower.pos_turns * 360.0f,
-        follower.vel_turns_s,
-        follower.torque_estimate_nm,
-        follower.axis_state,
-        (unsigned long)(now - follower.last_rx_ms),
-
-        (unsigned long)leader.enc_count,
-        (unsigned long)follower.enc_count,
-        (unsigned long)leader.tq_count,
-        (unsigned long)follower.tq_count,
-        r1,
-        r2
-    );
+    /* USER CODE BEGIN 3 */
   }
-  /* USER CODE END WHILE */
+  
+  /* USER CODE END 3 */
 }
 
 /**
