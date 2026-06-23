@@ -168,17 +168,17 @@ static int jc_set_torque_nm(FDCAN_HandleTypeDef *hcan, uint8_t node_id, float to
     return jc_send8(hcan, jc_tx_id(node_id), d);
 }
 
-void can_parse_feedback(uint16_t rx_id, uint8_t *d, uint8_t len)
+void can_parse_feedback(FDCAN_HandleTypeDef *hcan, uint16_t rx_id, uint8_t *d, uint8_t len)
 {
     if (len != 8) return;
 
     uint8_t node = 0;
     JC_MotorState *m = NULL;
 
-    if (rx_id == (0x580 + NODE_LEADER)) {
+    if (hcan == &hfdcan1 && rx_id == 0x580 + NODE_LEADER) {
         node = NODE_LEADER;
         m = &leader;
-    } else if (rx_id == (0x580 + NODE_FOLLOWER)) {
+    } else if (hcan == &hfdcan2 && rx_id == 0x580 + NODE_FOLLOWER) {
         node = NODE_FOLLOWER;
         m = &follower;
     } else {
@@ -258,7 +258,7 @@ int main(void)
 
   // If bsp_can_init() does not already enable RX interrupt, this makes it explicit.
   HAL_FDCAN_ActivateNotification(&hfdcan1, FDCAN_IT_RX_FIFO0_NEW_MESSAGE, 0);
-  HAL_FDCAN_ActivateNotification(&hfdcan1, FDCAN_IT_RX_FIFO0_NEW_MESSAGE, 0);
+  HAL_FDCAN_ActivateNotification(&hfdcan2, FDCAN_IT_RX_FIFO0_NEW_MESSAGE, 0);
 
   HAL_TIM_Base_Start_IT(&htim2);
 
@@ -269,13 +269,13 @@ int main(void)
   log_uart1("[INIT] idle motors\r\n");
   jc_idle(&hfdcan1, NODE_LEADER);
   HAL_Delay(100);
-  jc_idle(&hfdcan1, NODE_FOLLOWER);
+  jc_idle(&hfdcan2, NODE_FOLLOWER);
   HAL_Delay(100);
 
   log_uart1("[INIT] closed loop\r\n");
   if (jc_enter_closed_loop(&hfdcan1, NODE_LEADER) != 0) fatal("closed leader");
   HAL_Delay(100);
-  if (jc_enter_closed_loop(&hfdcan1, NODE_FOLLOWER) != 0) fatal("closed follower");
+  if (jc_enter_closed_loop(&hfdcan2, NODE_FOLLOWER) != 0) fatal("closed follower");
   HAL_Delay(100);
 
   log_uart1("[INIT] both torque mode\r\n");
@@ -283,13 +283,13 @@ int main(void)
   jc_set_mode(&hfdcan1, NODE_LEADER, 0);
   HAL_Delay(100);
 
-  jc_set_mode(&hfdcan1, NODE_FOLLOWER, 0);
+  jc_set_mode(&hfdcan2, NODE_FOLLOWER, 0);
   HAL_Delay(100);
 
   jc_set_torque_nm(&hfdcan1, NODE_LEADER, 0.0f);
   HAL_Delay(20);
 
-  jc_set_torque_nm(&hfdcan1, NODE_FOLLOWER, 0.0f);
+  jc_set_torque_nm(&hfdcan2, NODE_FOLLOWER, 0.0f);
   HAL_Delay(20);
 
 
@@ -336,7 +336,7 @@ int main(void)
     tau = clampf(tau, -TAU_MAX, TAU_MAX);
 
     int r1 = jc_set_torque_nm(&hfdcan1, NODE_LEADER, 0.9f * tau);
-    int r2 = jc_set_torque_nm(&hfdcan1, NODE_FOLLOWER, -tau);
+    int r2 = jc_set_torque_nm(&hfdcan2, NODE_FOLLOWER, -tau);
 
     // 10Hz debug only. Do not print at 1kHz.
     uint32_t now = HAL_GetTick();

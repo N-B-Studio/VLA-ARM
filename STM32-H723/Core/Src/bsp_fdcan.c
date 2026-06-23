@@ -1,6 +1,6 @@
 #include "bsp_fdcan.h"
 
-extern void can_parse_feedback(uint16_t rx_id, uint8_t *d, uint8_t len);
+extern void can_parse_feedback(FDCAN_HandleTypeDef *hcan, uint16_t rx_id, uint8_t *d, uint8_t len);
 /**
 ************************************************************************
 * @brief:       bsp_can_init(void)
@@ -12,9 +12,10 @@ extern void can_parse_feedback(uint16_t rx_id, uint8_t *d, uint8_t len);
 void bsp_can_init(void)
 {
 	can_filter_init();
-    HAL_FDCAN_Start(&hfdcan1);                               // Start FDCAN1
-    HAL_FDCAN_Start(&hfdcan2);                               // Start FDCAN2
+    HAL_FDCAN_Start(&hfdcan1);
+    HAL_FDCAN_Start(&hfdcan2);
 	//HAL_FDCAN_Start(&hfdcan3);
+
 	HAL_FDCAN_ActivateNotification(&hfdcan1, FDCAN_IT_RX_FIFO0_NEW_MESSAGE, 0);
 	HAL_FDCAN_ActivateNotification(&hfdcan2, FDCAN_IT_RX_FIFO0_NEW_MESSAGE, 0);
 	//HAL_FDCAN_ActivateNotification(&hfdcan3, FDCAN_IT_RX_FIFO0_NEW_MESSAGE, 0);
@@ -161,7 +162,7 @@ void fdcan1_rx_callback(void)
         uint8_t len = fdcanx_receive(&hfdcan1, &rec_id1, rx_data1);
         if (len > 0)
         {
-            can_parse_feedback(rec_id1, rx_data1, len);
+            can_parse_feedback(&hfdcan1, rec_id1, rx_data1, len);
         }
     }
 }
@@ -176,7 +177,7 @@ void fdcan2_rx_callback(void)
         uint8_t len = fdcanx_receive(&hfdcan2, &rec_id2, rx_data2);
         if (len > 0)
         {
-            can_parse_feedback(rec_id2, rx_data2, len);
+            can_parse_feedback(&hfdcan2, rec_id2, rx_data2, len);
         }
     }
 }
@@ -190,18 +191,21 @@ void fdcan2_rx_callback(void)
 
 void HAL_FDCAN_RxFifo0Callback(FDCAN_HandleTypeDef *hfdcan, uint32_t RxFifo0ITs)
 {
-    if(hfdcan == &hfdcan1)
-	{
-		fdcan1_rx_callback();
-	}
-	if(hfdcan == &hfdcan2)
-	{
-		fdcan2_rx_callback();
-	}
-	//if(hfdcan == &hfdcan3)
-	//{
-	//	fdcan3_rx_callback();
-	//}
+    FDCAN_RxHeaderTypeDef rxh;
+    uint8_t rxdata[8];
+
+    if ((RxFifo0ITs & FDCAN_IT_RX_FIFO0_NEW_MESSAGE) == 0) return;
+
+    if (hfdcan->Instance == FDCAN1) {
+        HAL_FDCAN_GetRxMessage(&hfdcan1, FDCAN_RX_FIFO0, &rxh, rxdata);
+        can_parse_feedback(&hfdcan1, rxh.Identifier, rxdata, 8);
+    }
+    else if (hfdcan->Instance == FDCAN2) {
+        HAL_FDCAN_GetRxMessage(&hfdcan2, FDCAN_RX_FIFO0, &rxh, rxdata);
+        can_parse_feedback(&hfdcan2, rxh.Identifier, rxdata, 8);
+    }
+
+    HAL_FDCAN_ActivateNotification(hfdcan, FDCAN_IT_RX_FIFO0_NEW_MESSAGE, 0);
 }
 
 

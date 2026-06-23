@@ -13,7 +13,7 @@
 ../Core/Src/main.c:148:12:jc_enter_closed_loop	24	static
 ../Core/Src/main.c:154:12:jc_idle	24	static
 ../Core/Src/main.c:160:12:jc_set_torque_nm	40	static
-../Core/Src/main.c:171:6:can_parse_feedback	32	static
+../Core/Src/main.c:171:6:can_parse_feedback	40	static
 ../Core/Src/main.c:204:13:fatal	16	static,ignoring_inline_asm
 ../Core/Src/main.c:218:5:main	120	static
 ../Core/Src/main.c:376:6:SystemClock_Config	120	static
