@@ -37,11 +37,16 @@ typedef struct {
     uint32_t last_rx_ms;
 } JC_MotorState;
 
-#define NODE_LEADER    1 // mot1 on can 1
-#define NODE_FOLLOWER  2 // mot2 on can 2
+#define NODE_LEADER_GRIPPER           1   // CAN1
+#define NODE_LEADER_WRIST             3   // CAN1
+#define NODE_FOLLOWER_GRIPPER         2   // CAN2
+#define NODE_FOLLOWER_WRIST           4   // CAN2
 
-static JC_MotorState leader   = {NODE_LEADER,   0};
-static JC_MotorState follower = {NODE_FOLLOWER, 0};
+static JC_MotorState leader_gripper   = {NODE_LEADER_GRIPPER,   0};
+static JC_MotorState leader_wrist     = {NODE_LEADER_WRIST,     0};
+static JC_MotorState follower_gripper = {NODE_FOLLOWER_GRIPPER, 0};
+static JC_MotorState follower_wrist   = {NODE_FOLLOWER_WRIST,   0};
+
 /* USER CODE END PM */
 
 /* Private variables ---------------------------------------------------------*/
@@ -58,8 +63,8 @@ static uint32_t can_rx_other = 0;
 // virtual coupling gains
 #define CTRL_DIV 1 // 1=1khz,2=500hz, 4=250hz, 10=100hz, 100=10hz,
 
-static float K_COUPLE = 0.18f;
-static float D_COUPLE = 0.015f;
+static float K_COUPLE = 0.16f;
+static float D_COUPLE = 0.012f;
 static float TAU_MAX  = 0.25f;
 
 static const float DEG2RAD = 0.01745329252f;
@@ -172,24 +177,25 @@ void can_parse_feedback(FDCAN_HandleTypeDef *hcan, uint16_t rx_id, uint8_t *d, u
 {
     if (len != 8) return;
 
-    uint8_t node = 0;
     JC_MotorState *m = NULL;
 
-    if (hcan == &hfdcan1 && rx_id == 0x580 + NODE_LEADER) {
-        node = NODE_LEADER;
-        m = &leader;
-    } else if (hcan == &hfdcan2 && rx_id == 0x580 + NODE_FOLLOWER) {
-        node = NODE_FOLLOWER;
-        m = &follower;
-    } else {
+    if (hcan == &hfdcan1 && rx_id == 0x580 + NODE_LEADER_GRIPPER) {
+        m = &leader_gripper;
+    }
+    else if (hcan == &hfdcan1 && rx_id == 0x580 + NODE_LEADER_WRIST) {
+        m = &leader_wrist;
+    }
+    else if (hcan == &hfdcan2 && rx_id == 0x580 + NODE_FOLLOWER_GRIPPER) {
+        m = &follower_gripper;
+    }
+    else if (hcan == &hfdcan2 && rx_id == 0x580 + NODE_FOLLOWER_WRIST) {
+        m = &follower_wrist;
+    }
+    else {
         can_rx_other++;
         return;
     }
 
-    (void)node;
-
-    // Torque/position/speed command reply:
-    // 2A [pos 24-bit, deg*100] [speed 16-bit, rpm*100] [current/torque 16-bit, *100]
     if (d[0] == 0x2A) {
         int32_t pos_raw = be_s24(&d[1]);
         int16_t vel_raw = be_s16(&d[4]);
@@ -267,43 +273,44 @@ int main(void)
   HAL_Delay(500);
 
   log_uart1("[INIT] idle motors\r\n");
-  jc_idle(&hfdcan1, NODE_LEADER);
-  HAL_Delay(100);
-  jc_idle(&hfdcan2, NODE_FOLLOWER);
-  HAL_Delay(100);
+  jc_idle(&hfdcan1, NODE_LEADER_GRIPPER);
+  HAL_Delay(50);
+  jc_idle(&hfdcan1, NODE_LEADER_WRIST);
+  HAL_Delay(50);
+  jc_idle(&hfdcan2, NODE_FOLLOWER_GRIPPER);
+  HAL_Delay(50);
+  jc_idle(&hfdcan2, NODE_FOLLOWER_WRIST);
+  HAL_Delay(50);
 
   log_uart1("[INIT] closed loop\r\n");
-  if (jc_enter_closed_loop(&hfdcan1, NODE_LEADER) != 0) fatal("closed leader");
-  HAL_Delay(100);
-  if (jc_enter_closed_loop(&hfdcan2, NODE_FOLLOWER) != 0) fatal("closed follower");
-  HAL_Delay(100);
+  if (jc_enter_closed_loop(&hfdcan1, NODE_LEADER_GRIPPER) != 0) fatal("closed leader gripper");
+  HAL_Delay(50);
+  if (jc_enter_closed_loop(&hfdcan1, NODE_LEADER_WRIST) != 0) fatal("closed leader wrist");
+  HAL_Delay(50);
+  if (jc_enter_closed_loop(&hfdcan2, NODE_FOLLOWER_GRIPPER) != 0) fatal("closed follower gripper");
+  HAL_Delay(50);
+  if (jc_enter_closed_loop(&hfdcan2, NODE_FOLLOWER_WRIST) != 0) fatal("closed follower wrist");
+  HAL_Delay(50);
 
-  log_uart1("[INIT] both torque mode\r\n");
+  log_uart1("[INIT] torque mode\r\n");
+  jc_set_mode(&hfdcan1, NODE_LEADER_GRIPPER, 0);   HAL_Delay(50);
+  jc_set_mode(&hfdcan1, NODE_LEADER_WRIST, 0);     HAL_Delay(50);
+  jc_set_mode(&hfdcan2, NODE_FOLLOWER_GRIPPER, 0); HAL_Delay(50);
+  jc_set_mode(&hfdcan2, NODE_FOLLOWER_WRIST, 0);   HAL_Delay(50);
 
-  jc_set_mode(&hfdcan1, NODE_LEADER, 0);
-  HAL_Delay(100);
-
-  jc_set_mode(&hfdcan2, NODE_FOLLOWER, 0);
-  HAL_Delay(100);
-
-  jc_set_torque_nm(&hfdcan1, NODE_LEADER, 0.0f);
-  HAL_Delay(20);
-
-  jc_set_torque_nm(&hfdcan2, NODE_FOLLOWER, 0.0f);
-  HAL_Delay(20);
+  jc_set_torque_nm(&hfdcan1, NODE_LEADER_GRIPPER, 0.0f);    HAL_Delay(20);
+  jc_set_torque_nm(&hfdcan1, NODE_LEADER_WRIST, 0.0f);      HAL_Delay(20);
+  jc_set_torque_nm(&hfdcan2, NODE_FOLLOWER_GRIPPER, 0.0f);  HAL_Delay(20);
+  jc_set_torque_nm(&hfdcan2, NODE_FOLLOWER_WRIST, 0.0f);    HAL_Delay(20);
 
 
   led_green();
-  logf_uart1("[OK] 1kHz demo running. leader=%d follower=%d\r\n", NODE_LEADER, NODE_FOLLOWER);
-  led_green();
+  logf_uart1("[OK] 1kHz demo running. leader=%d follower=%d\r\n", NODE_LEADER_GRIPPER, NODE_FOLLOWER_GRIPPER);
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
   uint32_t last_log_ms = HAL_GetTick();
-  uint32_t last_rx2 = 0, last_rx3 = 0;
-  float last_err_deg = 0.0f;
-
   while (1)
   {
     if (!loop_1khz_flag) continue;
@@ -314,50 +321,41 @@ int main(void)
         continue;
     }
 
-    float err_deg = leader.pos_deg - follower.pos_deg;
-    if(err_deg < 1.0f && err_deg > -1.0f)
-    {
-        err_deg = last_err_deg;
-    }
-        else
-        {
-        last_err_deg = err_deg;
-    }
+    float err_g_deg = leader_gripper.pos_deg - follower_gripper.pos_deg;
+    float dq_g = leader_gripper.vel_rpm * RPM2RAD - follower_gripper.vel_rpm * RPM2RAD;
+    float tau_g = -K_COUPLE * (err_g_deg * DEG2RAD) - D_COUPLE * dq_g;
+    tau_g = clampf(tau_g, -TAU_MAX, TAU_MAX);
 
-    float qL  = leader.pos_deg * DEG2RAD;
-    float qF  = follower.pos_deg * DEG2RAD;
-    float dqL = leader.vel_rpm * RPM2RAD;
-    float dqF = follower.vel_rpm * RPM2RAD;
+    float err_w_deg = leader_wrist.pos_deg - follower_wrist.pos_deg;
+    float dq_w = leader_wrist.vel_rpm * RPM2RAD - follower_wrist.vel_rpm * RPM2RAD;
+    float tau_w = -K_COUPLE * (err_w_deg * DEG2RAD) - D_COUPLE * dq_w;
+    tau_w = clampf(tau_w, -TAU_MAX, TAU_MAX);
 
-    float err  = err_deg * DEG2RAD;
-    float derr = dqL - dqF;
+    int r1 = jc_set_torque_nm(&hfdcan1, NODE_LEADER_GRIPPER, tau_g);
+    int r2 = jc_set_torque_nm(&hfdcan2, NODE_FOLLOWER_GRIPPER, -tau_g);
 
-    float tau = -K_COUPLE * err - D_COUPLE * derr;
-    tau = clampf(tau, -TAU_MAX, TAU_MAX);
-
-    int r1 = jc_set_torque_nm(&hfdcan1, NODE_LEADER, 0.9f * tau);
-    int r2 = jc_set_torque_nm(&hfdcan2, NODE_FOLLOWER, -tau);
+    int r3 = jc_set_torque_nm(&hfdcan1, NODE_LEADER_WRIST, tau_w);
+    int r4 = jc_set_torque_nm(&hfdcan2, NODE_FOLLOWER_WRIST, -tau_w);
 
     // 10Hz debug only. Do not print at 1kHz.
     uint32_t now = HAL_GetTick();
     if ((now - last_log_ms) >= 100)
     {
-        uint32_t drx2 = leader.rx_count - last_rx2;
-        uint32_t drx3 = follower.rx_count - last_rx3;
-        last_rx2 = leader.rx_count;
-        last_rx3 = follower.rx_count;
         last_log_ms = now;
 
         logf_uart1(
-            "qL %.2f qF %.2f e %.2f tau %.3f | rx %lu %lu r %d %d\r\n",
-            leader.pos_deg,
-            follower.pos_deg,
-            err,
-            tau,
-            (unsigned long)drx2,
-            (unsigned long)drx3,
-            r1,
-            r2
+            "G %.1f %.1f tau %.3f | W %.1f %.1f tau %.3f | rx %lu %lu %lu %lu | r %d %d %d %d\r\n",
+            leader_gripper.pos_deg,
+            follower_gripper.pos_deg,
+            tau_g,
+            leader_wrist.pos_deg,
+            follower_wrist.pos_deg,
+            tau_w,
+            leader_gripper.rx_count,
+            follower_gripper.rx_count,
+            leader_wrist.rx_count,
+            follower_wrist.rx_count,
+            r1, r2, r3, r4
         );
     }
 
