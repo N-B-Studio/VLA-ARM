@@ -3,6 +3,6 @@
 
 ## 3D Model Preview
 
-![VLA-ARM 3D Model](3D Model/image/image.jpg)
+<img width="1335" height="1368" alt="image" src="https://github.com/user-attachments/assets/de34c9e5-4186-40a2-930f-77b7b05713b6" />
 
-The image above shows the 3D model located in the `3D Model/image` folder.
+This is full stack solution for VLA-arm with force feedback gribber!
